@@ -1,6 +1,16 @@
 # MigrateRrdRetention — Plugin para LibreNMS
 
+![PHP](https://img.shields.io/badge/PHP-8.1%2B-blue)
+![LibreNMS](https://img.shields.io/badge/LibreNMS-compatible-green)
+![License](https://img.shields.io/badge/license-MIT-lightgrey)
+
 Plugin de administración que permite **migrar la retención de los archivos RRD** de LibreNMS a un nuevo esquema de alta resolución (`RRA:AVERAGE:0.5:1:114048 RRA:MAX:0.5:1:114048`) directamente desde la interfaz web. Incluye gestión de servicios, copia de seguridad automática y configuración de sudoers. **Solo accesible para administradores. No modifica ningún archivo del núcleo de LibreNMS.**
+
+## Screenshots
+
+![Panel principal](screenshots/main.png)
+
+> Convierte todos los archivos RRD a retención de 13 meses con datos crudos cada 5 min (114,048 filas), con backup automático y control de servicios desde la interfaz.
 
 ---
 
