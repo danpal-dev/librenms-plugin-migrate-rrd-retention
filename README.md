@@ -98,6 +98,10 @@ rm -rf /opt/librenms/app/Plugins/MigrateRrdRetention
 - PHP 8.1+
 - Python 3 (para el script de migración RRD).
 - `rrdtool` instalado en el servidor.
+
+## Base de datos
+
+El plugin **no crea tablas nuevas ni escribe en `devices_attribs`**. La configuración de retención se guarda en la columna `settings` (JSON) de la tabla `plugins`. El script Python opera directamente sobre archivos `.rrd` en disco, sin modificar la base de datos.
 - Permisos de sudoers configurados correctamente.
 
 ---
