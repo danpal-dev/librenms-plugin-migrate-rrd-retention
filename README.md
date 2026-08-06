@@ -59,6 +59,8 @@ www-data ALL=(ALL) NOPASSWD: /bin/systemctl stop librenms-scheduler.timer, /bin/
 
 ### Actualizar
 
+> Repositorio: https://github.com/danpal-dev/librenms-plugin-migrate-rrd-retention
+
 ```bash
 cd /opt/librenms/app/Plugins/MigrateRrdRetention
 git pull
