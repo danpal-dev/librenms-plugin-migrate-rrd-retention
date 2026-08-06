@@ -62,6 +62,9 @@ www-data ALL=(ALL) NOPASSWD: /bin/systemctl stop librenms-scheduler.timer, /bin/
 ```bash
 cd /opt/librenms/app/Plugins/MigrateRrdRetention
 git pull
+chown -R librenms:librenms .
+sudo -u librenms php artisan view:cache
+sudo -u librenms php artisan cache:clear
 ```
 
 ### Desinstalar
