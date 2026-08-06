@@ -42,7 +42,18 @@ class Settings extends SettingsHook
     private function sudoersOk(): bool
     {
         // Si el sudoers está bien, este comando no pedirá contraseña
-        $out = (string) shell_exec('sudo -n systemctl status librenms-scheduler.timer 2>&1');
+        $proc = proc_open(
+            ['sudo', '-n', 'systemctl', 'status', 'librenms-scheduler.timer'],
+            [1 => ['pipe', 'w'], 2 => ['pipe', 'w']],
+            $pipes
+        );
+        if (! is_resource($proc)) {
+            return false;
+        }
+        $out = stream_get_contents($pipes[1]) . stream_get_contents($pipes[2]);
+        fclose($pipes[1]);
+        fclose($pipes[2]);
+        proc_close($proc);
 
         return ! str_contains($out, 'password is required')
             && ! str_contains($out, 'not allowed');

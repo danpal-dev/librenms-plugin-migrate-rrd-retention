@@ -60,11 +60,24 @@ class Page extends PageHook
             ]);
         }
 
-        $log = escapeshellarg(self::LOG_PATH);
-        $pid = escapeshellarg(self::PID_PATH);
-        $py  = escapeshellarg(self::SCRIPT_PATH);
-
-        shell_exec("nohup python3 {$py} > {$log} 2>&1 & echo \$! > {$pid}");
+        // Lanzar sin shell: proc_open con array de argumentos evita interpolación de shell
+        $descriptors = [
+            0 => ['file', '/dev/null', 'r'],
+            1 => ['file', self::LOG_PATH, 'w'],
+            2 => ['file', self::LOG_PATH, 'a'],
+        ];
+        $proc = proc_open(
+            ['python3', self::SCRIPT_PATH],
+            $descriptors,
+            $pipes
+        );
+        if (is_resource($proc)) {
+            $status = proc_get_status($proc);
+            if ($status['pid'] > 0) {
+                file_put_contents(self::PID_PATH, (string) $status['pid']);
+            }
+            proc_close($proc);
+        }
 
         // Aplicar config automáticamente al iniciar la migración
         $this->applyRrdRraConfig();
@@ -138,7 +151,16 @@ class Page extends PageHook
             return;
         }
         foreach (self::SERVICES as $svc) {
-            shell_exec('sudo systemctl ' . $op . ' ' . escapeshellarg($svc) . ' 2>&1');
+            $proc = proc_open(
+                ['sudo', 'systemctl', $op, $svc],
+                [0 => ['file', '/dev/null', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']],
+                $pipes
+            );
+            if (is_resource($proc)) {
+                fclose($pipes[1]);
+                fclose($pipes[2]);
+                proc_close($proc);
+            }
         }
         // Pequeña pausa para que systemd refleje el cambio de estado
         sleep(2);
@@ -169,12 +191,24 @@ class Page extends PageHook
         return $running;
     }
 
-    /** Lee las últimas $lines líneas del log sin cargar el archivo completo en memoria. */
+    /** Lee las últimas $lines líneas del log usando SplFileObject (sin shell). */
     private function readLogTail(string $path, int $lines = 200): string
     {
-        $result = shell_exec('tail -n ' . (int) $lines . ' ' . escapeshellarg($path) . ' 2>/dev/null');
+        if (! is_readable($path)) {
+            return '';
+        }
+        $file = new \SplFileObject($path, 'r');
+        $file->seek(PHP_INT_MAX);
+        $total = $file->key();
+        $start = max(0, $total - $lines);
+        $result = [];
+        $file->seek($start);
+        while (! $file->eof()) {
+            $result[] = $file->current();
+            $file->next();
+        }
 
-        return $result ?? '';
+        return implode('', $result);
     }
 
     /** Devuelve true si el estado indica que el servicio/timer está corriendo. */
@@ -188,8 +222,18 @@ class Page extends PageHook
     {
         $result = [];
         foreach (self::SERVICES as $svc) {
-            $out = trim((string) shell_exec("systemctl is-active " . escapeshellarg($svc) . " 2>/dev/null"));
-            // timer activo = 'active' (waiting); timer parado = 'inactive'
+            $proc = proc_open(
+                ['systemctl', 'is-active', $svc],
+                [1 => ['pipe', 'w'], 2 => ['file', '/dev/null', 'w']],
+                $pipes
+            );
+            if (is_resource($proc)) {
+                $out = trim((string) stream_get_contents($pipes[1]));
+                fclose($pipes[1]);
+                proc_close($proc);
+            } else {
+                $out = 'unknown';
+            }
             $result[$svc] = in_array($out, ['active', 'inactive', 'waiting'], true) ? $out : 'unknown';
         }
 

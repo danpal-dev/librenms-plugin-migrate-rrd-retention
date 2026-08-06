@@ -187,7 +187,18 @@
 
     {{-- Nota sudo: solo si el sudoers no está configurado --}}
     @php
-        $sudoOut  = (string) shell_exec('sudo -n systemctl status librenms-scheduler.timer 2>&1');
+        $sudoProc = proc_open(
+            ['sudo', '-n', 'systemctl', 'status', 'librenms-scheduler.timer'],
+            [1 => ['pipe', 'w'], 2 => ['pipe', 'w']],
+            $sudoPipes
+        );
+        if (is_resource($sudoProc)) {
+            $sudoOut   = stream_get_contents($sudoPipes[1]) . stream_get_contents($sudoPipes[2]);
+            fclose($sudoPipes[1]); fclose($sudoPipes[2]);
+            proc_close($sudoProc);
+        } else {
+            $sudoOut = 'not allowed';
+        }
         $sudoersOk = !str_contains($sudoOut, 'password is required') && !str_contains($sudoOut, 'not allowed');
     @endphp
     @if(!$sudoersOk)

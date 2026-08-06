@@ -12,6 +12,8 @@ Los datos crudos existentes (rra[0] y rra[3], pdp_per_row=1) se preservan.
 """
 
 import os
+import shlex
+import stat
 import subprocess
 import xml.etree.ElementTree as ET
 import glob
@@ -22,155 +24,192 @@ TARGET_ROWS = 114048
 BACKUP_DIR = "/opt/librenms/rrd_backup_pre_migration"
 ERROR_LOG = "/opt/librenms/logs/migrate-rrd-retention-errors.log"
 
-def run(cmd, check=True):
-    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+# Usuario/grupo destino para todos los archivos RRD
+RRD_USER = "librenms"
+RRD_GROUP = "librenms"
+
+
+def _resolve_uid_gid() -> tuple[int, int]:
+    """Resuelve uid/gid de librenms una sola vez al arrancar."""
+    import pwd, grp
+    try:
+        uid = pwd.getpwnam(RRD_USER).pw_uid
+        gid = grp.getgrnam(RRD_GROUP).gr_gid
+    except KeyError as e:
+        raise SystemExit(f"ERROR: usuario/grupo '{e}' no encontrado en el sistema.")
+    return uid, gid
+
+
+# UID/GID resueltos globalmente
+_TARGET_UID, _TARGET_GID = _resolve_uid_gid()
+
+
+def run_cmd(args: list[str], check: bool = True) -> str:
+    """Ejecuta un comando como lista (sin shell=True) para evitar inyección."""
+    result = subprocess.run(args, capture_output=True, text=True)
     if check and result.returncode != 0:
-        raise RuntimeError(f"Error ejecutando: {cmd}\n{result.stderr}")
+        raise RuntimeError(
+            f"Error ejecutando: {shlex.join(args)}\n{result.stderr.strip()}"
+        )
     return result.stdout
 
-def migrate_rrd(rrd_path):
-    """Migra un archivo RRD a retención 13 meses sin agrupamiento."""
-    
-    # 1. Exportar a XML
-    with tempfile.NamedTemporaryFile(suffix=".xml", delete=False) as f:
-        xml_path = f.name
-    
+
+def fix_permissions(path: str, mode: int = 0o664) -> None:
+    """Aplica propietario y permisos correctos inmediatamente tras crear/reemplazar un archivo."""
+    os.chown(path, _TARGET_UID, _TARGET_GID)
+    os.chmod(path, mode)
+
+
+def migrate_rrd(rrd_path: str) -> tuple[bool, str]:
+    """Migra un archivo RRD a retención 13 meses sin agrupamiento.
+
+    Preserva propietario y permisos del archivo original en el archivo resultante.
+    """
+    # Capturar stat ANTES de cualquier modificación
+    orig_stat = os.stat(rrd_path)
+    orig_uid = orig_stat.st_uid
+    orig_gid = orig_stat.st_gid
+    orig_mode = stat.S_IMODE(orig_stat.st_mode)
+
+    xml_fd, xml_path = tempfile.mkstemp(suffix=".xml", dir="/tmp")
+    os.close(xml_fd)
+    new_rrd = rrd_path + ".new"
+
     try:
-        run(f'rrdtool dump "{rrd_path}" > "{xml_path}"')
-        
+        # 1. Exportar a XML usando stdout (sin shell redirection)
+        with open(xml_path, "w") as xml_out:
+            result = subprocess.run(
+                ["rrdtool", "dump", rrd_path],
+                stdout=xml_out,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(f"rrdtool dump falló: {result.stderr.strip()}")
+
         tree = ET.parse(xml_path)
         root = tree.getroot()
-        
+
         # Determinar cuántos DS hay
-        ds_count = len(root.findall('ds'))
-        
+        ds_count = len(root.findall("ds"))
+
         # Encontrar RRAs a conservar (pdp_per_row = 1)
-        rras = root.findall('rra')
+        rras = root.findall("rra")
         raw_rras = []
         aggregated_rras = []
-        
+
         for rra in rras:
-            pdp = int(rra.find('pdp_per_row').text.strip())
-            cf = rra.find('cf').text.strip()
+            pdp = int(rra.find("pdp_per_row").text.strip())
+            cf = rra.find("cf").text.strip()
             if pdp == 1:
                 raw_rras.append((cf, rra))
             else:
                 aggregated_rras.append(rra)
-        
+
         # Si no hay RRAs crudos, no podemos migrar
         if not raw_rras:
             return False, "No se encontraron RRAs con pdp_per_row=1"
-        
-        # Verificar que tengamos AVERAGE y MAX crudos
-        # (raw_cfs disponible por si se necesita ampliar la lógica)
+
         # Eliminar RRAs agrupados del árbol
         for rra in aggregated_rras:
             root.remove(rra)
-        
+
         # Expandir los RRAs crudos a TARGET_ROWS
         first_count = None
         for cf, rra in raw_rras:
-            db = rra.find('database')
+            db = rra.find("database")
             current_rows_elem = list(db)
             current_count = len(current_rows_elem)
             if first_count is None:
-                first_count = current_count  # guardar del primer RRA para el mensaje final
-            
-            # Actualizar el número de filas en la cabecera del RRA (no existe explícito, lo maneja rrdtool)
-            # Necesitamos agregar filas NaN al principio para llegar a TARGET_ROWS
+                first_count = current_count
+
             rows_to_add = TARGET_ROWS - current_count
             if rows_to_add > 0:
-                # Construir una fila NaN con el número correcto de DS
                 nan_values = "".join([f"<v>NaN</v>" for _ in range(ds_count)])
-                
-                # Insertar al principio (datos más antiguos)
-                # ET no tiene insert_before fácil, reconstruimos
                 existing_rows = list(db)
                 for child in existing_rows:
                     db.remove(child)
-                
-                # Agregar filas NaN primero
                 for _ in range(rows_to_add):
-                    row_el = ET.fromstring(f"<row>{nan_values}</row>")
-                    db.append(row_el)
-                
-                # Luego los datos reales
+                    db.append(ET.fromstring(f"<row>{nan_values}</row>"))
                 for row in existing_rows:
                     db.append(row)
-            
-            # Si hay más filas que TARGET_ROWS, recortar las más antiguas
             elif rows_to_add < 0:
                 all_rows = list(db)
-                # Mantener las más recientes (las últimas TARGET_ROWS)
-                to_remove = all_rows[:abs(rows_to_add)]
-                for row in to_remove:
+                for row in all_rows[: abs(rows_to_add)]:
                     db.remove(row)
-        
-        # Si falta MAX, agregar RRA MAX basado en el AVERAGE (con NaN)
-        has_max = any(cf == 'MAX' for cf, _ in raw_rras)
-        has_avg = any(cf == 'AVERAGE' for cf, _ in raw_rras)
-        
+
+        # Si falta MAX, agregar RRA MAX con NaN basado en AVERAGE
+        has_max = any(cf == "MAX" for cf, _ in raw_rras)
+        has_avg = any(cf == "AVERAGE" for cf, _ in raw_rras)
         if has_avg and not has_max:
-            # Clonar la estructura del AVERAGE pero con cf=MAX y todo NaN
-            avg_rra = next(rra for cf, rra in raw_rras if cf == 'AVERAGE')
+            avg_rra = next(rra for cf, rra in raw_rras if cf == "AVERAGE")
             max_rra = ET.fromstring(ET.tostring(avg_rra))
-            max_rra.find('cf').text = 'MAX'
-            db = max_rra.find('database')
-            all_rows = list(db)
-            nan_values = "".join([f"<v>NaN</v>" for _ in range(ds_count)])
-            for row in all_rows:
+            max_rra.find("cf").text = "MAX"
+            db = max_rra.find("database")
+            for row in list(db):
                 db.remove(row)
+            nan_values = "".join([f"<v>NaN</v>" for _ in range(ds_count)])
             for _ in range(TARGET_ROWS):
                 db.append(ET.fromstring(f"<row>{nan_values}</row>"))
             root.append(max_rra)
-        
-        # Guardar XML modificado
-        tree.write(xml_path, encoding='utf-8', xml_declaration=True)
-        
-        # 2. Crear nuevo RRD desde el XML modificado
-        new_rrd = rrd_path + ".new"
-        run(f'rrdtool restore "{xml_path}" "{new_rrd}"')
-        
-        # 3. Reemplazar el original
+
+        # 2. Guardar XML modificado
+        tree.write(xml_path, encoding="utf-8", xml_declaration=True)
+
+        # 3. Crear nuevo RRD desde el XML modificado
+        run_cmd(["rrdtool", "restore", xml_path, new_rrd])
+
+        # 4. Reemplazar el original de forma atómica
         os.replace(new_rrd, rrd_path)
-        
+
+        # 5. CRÍTICO: restaurar propietario y permisos inmediatamente
+        #    (os.replace hereda el stat del archivo .new, no del original)
+        os.chown(rrd_path, orig_uid, orig_gid)
+        os.chmod(rrd_path, orig_mode)
+
         return True, f"Migrado: {first_count} → {TARGET_ROWS} filas"
-        
+
     finally:
+        # Limpiar archivos temporales siempre, incluso si hay error
         if os.path.exists(xml_path):
             os.unlink(xml_path)
-        new_rrd = rrd_path + ".new"
         if os.path.exists(new_rrd):
+            # Si llegamos aquí con .new existente, es porque replace falló
+            # o fue interrumpido — lo eliminamos para no dejar basura root
             os.unlink(new_rrd)
 
-def check_dependencies():
+
+def check_dependencies() -> None:
     """Verifica que rrdtool esté instalado antes de empezar."""
-    result = subprocess.run('which rrdtool', shell=True, capture_output=True)
+    result = subprocess.run(["which", "rrdtool"], capture_output=True)
     if result.returncode != 0:
         raise SystemExit("ERROR: rrdtool no está instalado o no está en el PATH.")
 
-def main():
+
+def main() -> None:
     check_dependencies()
 
     # Buscar todos los RRD
     rrd_files = glob.glob(f"{RRD_DIR}/**/*.rrd", recursive=True)
     total = len(rrd_files)
     print(f"Encontrados {total} archivos RRD")
-    print(f"Destino: {TARGET_ROWS} filas (5 min × 396 días = 13 meses sin agrupamiento)")
+    print(
+        f"Destino: {TARGET_ROWS} filas (5 min × 396 días = 13 meses sin agrupamiento)"
+    )
     print()
-    
+
     # Crear backup del directorio (hardlinks para ahorrar espacio)
     if not os.path.exists(BACKUP_DIR):
         print(f"Creando backup en {BACKUP_DIR}...")
-        run(f'cp -al "{RRD_DIR}" "{BACKUP_DIR}"')
+        run_cmd(["cp", "-al", RRD_DIR, BACKUP_DIR])
         print("Backup creado.")
     else:
         print(f"Backup ya existe en {BACKUP_DIR}, continuando...")
     print()
-    
+
     ok = 0
     errors = []
-    
+
     for i, rrd_path in enumerate(rrd_files, 1):
         rel = os.path.relpath(rrd_path, RRD_DIR)
         try:
@@ -185,22 +224,37 @@ def main():
         except Exception as e:
             errors.append((rel, str(e)))
             print(f"[{i}/{total}] ERROR {rel}: {e}")
-    
+
     print()
     print(f"=== Completado: {ok}/{total} migrados ===")
+
     if errors:
         print(f"Errores ({len(errors)}) — detalle completo en: {ERROR_LOG}")
-        with open(ERROR_LOG, 'w') as ef:
+        with open(ERROR_LOG, "w") as ef:
             ef.write(f"Errores de migración ({len(errors)}):\n")
             for name, err in errors:
                 ef.write(f"  - {name}: {err}\n")
-        # Mostrar también en el log principal (tail puede recortarlos, pero el archivo de errores siempre está completo)
+        # Ajustar permisos del log inmediatamente
+        fix_permissions(ERROR_LOG, mode=0o640)
         for name, err in errors:
             print(f"  - {name}: {err}")
-    
-    # Ajustar permisos
-    run(f'chown -R librenms:librenms "{RRD_DIR}"')
-    print("Permisos ajustados.")
+
+    # Auditoría final: verificar si quedó algún archivo sin propietario correcto
+    wrong = []
+    for rrd_path in glob.glob(f"{RRD_DIR}/**/*.rrd", recursive=True):
+        s = os.stat(rrd_path)
+        if s.st_uid != _TARGET_UID or s.st_gid != _TARGET_GID:
+            wrong.append(rrd_path)
+
+    if wrong:
+        print(f"\n[WARN] {len(wrong)} archivo(s) con propietario incorrecto — corrigiendo...")
+        for p in wrong:
+            fix_permissions(p)
+        print("Permisos corregidos.")
+    else:
+        print("\n[OK] Todos los archivos RRD tienen propietario correcto.")
+
 
 if __name__ == "__main__":
     main()
+
